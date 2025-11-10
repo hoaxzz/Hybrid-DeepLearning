@@ -1,99 +1,110 @@
-import torch, torch.nn as nn, torch.nn.functional as F
-from torch import Tensor
+# model.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-# ---------- utilitas ----------
-class DepthwiseSeparableConv1d(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel=15, stride=1, padding=7):
+# ------------------ Branch 1 : CNN Clean ------------------
+class ResidualBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=7, stride=1, padding=3):
         super().__init__()
-        self.depth = nn.Conv1d(in_ch, in_ch, kernel, stride, padding, groups=in_ch, bias=False)
-        self.point = nn.Conv1d(in_ch, out_ch, 1, bias=False)
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.relu = nn.ReLU(inplace=True)
-    def forward(self, x):
-        return self.relu(self.bn(self.point(self.depth(x))))
-
-class ResBlock(nn.Module):
-    def __init__(self, ch, kernel=15):
-        super().__init__()
-        pad = kernel//2
-        self.net = nn.Sequential(
-            nn.Conv1d(ch, ch, kernel, 1, pad, bias=False),
-            nn.BatchNorm1d(ch),
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size, stride, padding, groups=in_ch),  # depthwise
+            nn.Conv1d(out_ch, out_ch, 1),                                           # pointwise
+            nn.BatchNorm1d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv1d(ch, ch, kernel, 1, pad, bias=False),
-            nn.BatchNorm1d(ch)
+            nn.Conv1d(out_ch, out_ch, kernel_size, 1, padding, groups=out_ch),
+            nn.Conv1d(out_ch, out_ch, 1),
+            nn.BatchNorm1d(out_ch)
         )
-        self.relu = nn.ReLU(inplace=True)
+        self.skip = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
     def forward(self, x):
-        return self.relu(x + self.net(x))
+        return F.relu(self.skip(x) + self.conv(x))
 
-# ---------- Transformer ----------
-class TransformerBranch(nn.Module):
-    def __init__(self, d_model, num_layers, num_heads, dropout=0.1):
+class CNNEncoder(nn.Module):
+    def __init__(self, channels, layers=[2, 2, 2], base=64):
         super().__init__()
+        self.input_proj = nn.Conv1d(channels, base, 7, padding=3)
+        self.blocks = nn.ModuleList()
+        ch = base
+        for i, L in enumerate(layers):
+            for _ in range(L):
+                self.blocks.append(ResidualBlock(ch, ch*2 if i==len(layers)-1 else ch))
+            if i < len(layers)-1:
+                self.blocks.append(nn.Conv1d(ch, ch*2, 2, stride=2))  # down
+                ch *= 2
+        self.out_ch = ch
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        for layer in self.blocks:
+            x = layer(x)
+        return x
+
+# ------------------ Branch 2 : Transformer Noise ------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() *
+                        -(torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0).transpose(1,2))  # (1, d_model, max_len)
+
+    def forward(self, x):
+        # x: (B, d_model, T)
+        return x + self.pe[:, :, :x.size(2)]
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, channels, d_model=128, nhead=8, num_layers=4):
+        super().__init__()
+        self.input_proj = nn.Conv1d(channels, d_model, 1)
+        self.pos_enc = PositionalEncoding(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads,
-            dim_feedforward=4*d_model, dropout=dropout,
-            batch_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pos_enc = nn.Parameter(torch.randn(1, 512, d_model)*0.02)  # T max 512
-    def forward(self, x):   # x: (B,T,d_model)
-        x = x + self.pos_enc[:, :x.size(1), :]
-        return self.encoder(x)
+            d_model=d_model, nhead=nhead, dim_feedforward=512,
+            dropout=0.1, activation='gelu', batch_first=False)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.d_model = d_model
 
-# ---------- Fusion Gate ----------
+    def forward(self, x):
+        # x: (B, C, T)  -> (T, B, d_model)
+        x = self.input_proj(x).transpose(1,2).transpose(0,1)
+        x = self.pos_enc(x.transpose(0,2)).transpose(0,2)  # add pos
+        x = self.transformer(x)                              # (T, B, d_model)
+        return x.transpose(0,1).transpose(1,2)               # (B, d_model, T)
+
+# ------------------ Fusion & Head ------------------
 class GatedFusion(nn.Module):
-    def __init__(self, ch):
+    def __init__(self, cnn_ch, trans_ch, out_ch=64):
         super().__init__()
-        self.w = nn.Sequential(
-            nn.Conv1d(ch*2, ch, 1, bias=False),
-            nn.Sigmoid()
-        )
-    def forward(self, f1, f2):  # both (B,ch,T)
-        merged = torch.cat([f1, f2], dim=1)
-        gate = self.w(merged)
-        return gate*f1 + (1-gate)*f2
+        self.gate_cnn  = nn.Conv1d(cnn_ch, out_ch, 1)
+        self.gate_trans= nn.Conv1d(trans_ch, out_ch, 1)
+        self.out_proj  = nn.Conv1d(out_ch, out_ch, 1)
 
-# ---------- Model Utama ----------
-class DualBranchDenoiser(nn.Module):
-    def __init__(self, C, T,
-                 conv_channels=[32,64,128],
-                 transformer_dim=128,
-                 transformer_layers=4,
-                 num_heads=8):
+    def forward(self, cnn_feat, trans_feat):
+        # cnn_feat: (B, cnn_ch, T)   trans_feat: (B, trans_ch, T)
+        g = torch.sigmoid(self.gate_cnn(cnn_feat) + self.gate_trans(trans_feat))
+        fused = g * cnn_feat[:, :g.size(1)] + (1-g) * trans_feat[:, :g.size(1)]
+        return self.out_proj(fused)
+
+class EEGDenoiser(nn.Module):
+    def __init__(self, C=22, T=512):
         super().__init__()
-        # --- CNN branch (Clean Learning) ---
-        self.input_proj = nn.Conv1d(C, conv_channels[0], 1, bias=False)
-        cnn = []
-        for i in range(len(conv_channels)):
-            ch = conv_channels[i]
-            cnn += [ResBlock(ch), DepthwiseSeparableConv1d(ch, ch)]
-        self.cnn_branch = nn.Sequential(*cnn)
+        self.cnn_branch = CNNEncoder(C)
+        self.trans_branch= TransformerEncoder(C)
+        self.fuse = GatedFusion(self.cnn_branch.out_ch, self.trans_branch.d_model)
+        self.head = nn.Conv1d(64, C, 1)
 
-        # --- Transformer branch (Noise Learning) ---
-        self.tf_proj = nn.Conv1d(C, transformer_dim, 1)
-        self.tf_branch = TransformerBranch(d_model=transformer_dim,
-                                           num_layers=transformer_layers,
-                                           num_heads=num_heads)
+    def forward(self, x):
+        # x: (B, C, T)
+        cnn_feat = self.cnn_branch(x)
+        trans_feat= self.trans_branch(x)
+        fused = self.fuse(cnn_feat, trans_feat)
+        return self.head(fused)  # residual learning: noise = model(x); clean = x - noise
 
-        # --- Fusion & output ---
-        self.fusion = GatedFusion(transformer_dim)
-        self.out_conv = nn.Conv1d(transformer_dim, C, 1)
-
-    def forward(self, x):  # x: (B,C,T)
-        # CNN
-        f1 = self.input_proj(x)          # (B,c1,T)
-        f1 = self.cnn_branch(f1)         # (B,c_last,T)
-
-        # Transformer
-        f2 = self.tf_proj(x).transpose(1,2)  # (B,T,d)
-        f2 = self.tf_branch(f2)              # (B,T,d)
-        f2 = f2.transpose(1,2)               # (B,d,T)
-
-        # Pastikan dimensi sama
-        if f1.size(1) != f2.size(1):
-            pad = f2.size(1) - f1.size(1)
-            f1 = F.pad(f1, (0,0,0,pad))      # pad channel jika perlu
-
-        fused = self.fusion(f1, f2)
-        return self.out_conv(fused)      # (B,C,T)
+if __name__ == "__main__":
+    from torchinfo import summary
+    model = EEGDenoiser(C=22, T=512)
+    summary(model, (1, 22, 512))
